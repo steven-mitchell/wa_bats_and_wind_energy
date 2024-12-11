@@ -1,0 +1,2316 @@
+---
+title: "Bats and Wind Energy"
+subtitle: "Identifying Areas for Wind Energy Development Outside of Bat Habitat"
+author: "Steven Mitchell"
+date: last-modified
+execute: 
+  eval: true
+  echo: true
+  warning: false
+  message: false
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: lux
+editor_options: 
+  chunk_output_type: console
+---
+
+
+# Setup
+```{r setup}
+library(wallace)
+library(tmap)
+library(here)
+library(sf)
+library(sp)
+library(terra)
+library(stars)
+library(viridisLite)
+library(tidyverse)
+library(units)
+```
+
+## Map Color Palette
+```{r}
+map_palette <- c("#c1c1c1", "#66FF66", "#33CC33", "#009933", "#003300")
+```
+
+## Washington State Vectors
+```{r}
+# make a WA state cookie-cutter vector
+wa <- read_sf(here( "data", "development_data", "counties", "tl_2023_us_county"))
+
+## check / transform CRS 
+if(st_crs(wa) == st_crs("EPSG: 4326")){
+  print("WA CRS is already WGS84")
+} else{
+  warning("Updated WA CRS to WGS84")
+  wa <- st_transform(wa, st_crs("EPSG: 4326"))
+}
+
+## crop to WA state
+wa <- wa %>% 
+  filter(STATEFP == 53)
+
+# make a WA state border
+wa_border <- st_union(wa)
+
+## check / transform CRS 
+if(st_crs(wa_border) == st_crs("EPSG: 4326")){
+  print("WA CRS is already WGS84")
+} else{
+  warning("Updated WA CRS to WGS84")
+  wa_border <- st_transform(wa_border, st_crs("EPSG: 4326"))
+}
+
+write_sf(wa_border, here("outputs", "intermediate_outputs", "templates", "wa_border.shp"))
+```
+
+## Washington State raster template
+```{r template raster}
+# make a template raster
+
+## start with a raster from the env data
+raster_template <- rast(here("data", "env_data", "wc2.1_30s_srad", 
+                             "wc2.1_30s_srad_07.tif"))
+
+## crop it to WA
+raster_template <- terra::crop(raster_template, wa)
+
+## extract the extent, resolution, and crs
+ext <- ext(raster_template)  # Get extent (xmin, ymin, xmax, ymax)
+res <- res(raster_template)  # Get resolution (x, y)
+crs <- crs(raster_template)  # Get CRS
+
+## make a blank raster with the same extent, resolution, and CRS
+raster_template <- rast(ext = ext, res = res, crs = crs, 
+                        vals = c(1:395080),
+                        names = "centroid_id")
+
+## check / transform template raster CRS
+if(st_crs(raster_template) == st_crs("EPSG: 4326")){
+  print("grid raster CRS is already WGS84")
+} else{
+  warning("updated raster_template CRS to WGS 84")
+  raster_template <- project(raster_template, "EPSG: 4326")
+}
+
+## crop the raster template to WA
+raster_template <- terra::crop(raster_template, wa)
+```
+
+## Washington State grid of raster cell centroids
+```{r template raster, execute = FALSE}
+# WA state 1km grid
+
+# make a blank grid of polygons matching env rasters (vector grid)
+wa_grid_1km <- terra::as.polygons(raster_template) %>% 
+  st_as_sf()
+
+## save wa grid for later
+ write_sf(wa_grid_1km, here("outputs", "intermediate_outputs", "templates", 
+ "grid_vector.shp"))
+
+# wa state 1km centroid grid
+
+# make centroids for the grid cells
+ grid_centroids <- st_centroid(wa_grid_1km)
+
+## crop the centroids to WA state
+ wa_centroids_1km <- st_intersection(grid_centroids, wa_border)
+
+## save it for later
+ write_sf(wa_centroids_1km, here("outputs", "intermediate_outputs", "templates", "wa_centroids_1km.shp"))
+
+# load the saved centroids vector instead of re-computing
+wa_centroids_1km <- read_sf(here("outputs", "intermediate_outputs", "templates", "wa_centroids_1km.shp"))
+
+## check / transform power lines CRS 
+if(st_crs(wa_centroids_1km) == st_crs("EPSG: 4326")){
+  print("WA Centroids CRS is already WGS84")
+} else{
+  warning("Updated WA Centroids CRS to WGS84")
+wa_centroids_1km <- st_transform(wa_centroids_1km, st_crs("EPSG: 4326"))
+}
+
+# centroids visualization
+map_wa_centroids_1km <- tm_shape(wa_centroids_1km)+
+  tm_dots(size = 0.001)+
+  tm_shape(wa_border)+
+  tm_borders()
+
+tmap_save(map_wa_centroids_1km,  here("outputs", "intermediate_outputs", "templates", "map_wa_centroids_1km.png", width = 16200, height = 10800))
+```
+
+# Part 1: Wind Energy Site Suitability
+## Component Variables
+
+### Wind Energy Potential
+#### For loop to read in the csv files
+```{r}
+# List all CSV files in the folder
+ wind_csv_list <- list.files(path = here("data", "nrel"), 
+                            pattern = ".csv", full.names = TRUE)
+
+# Create an empty list to store the average wind speed values
+ wind_avg_list <- list()
+
+# Loop through each CSV file
+ for (file in wind_csv_list) {
+  
+#  # Read the CSV file into a data frame, skipping the first row
+  df <- read.csv(file, skip = 1)
+  
+#  # Combine the year, month, day, hour, and minute columns into a datetime column
+  df$datetime <- make_datetime(df$Year, df$Month, df$Day, df$Hour, df$Minute)
+  
+#  # Reference the wind speed column by its full name
+  colnames(df)[which(names(df) == "wind.speed.at.100m..m.s.")] <- "wind_speed"
+  
+#  # Extract information from filenames (latitude and longitude)
+  file_name <- basename(file)
+  lat <- as.numeric(sub("^(\\d+)_(-?\\d+\\.\\d+)_(-?\\d+\\.\\d+)_.*$", 
+                        "\\2", file_name))  # Extract latitude
+  long <- as.numeric(sub("^(\\d+)_(-?\\d+\\.\\d+)_(-?\\d+\\.\\d+)_.*$", 
+                         "\\3", file_name))  # Extract longitude
+  
+
+  # Group by latitude and longitude, and calculate the average wind speed for the time period
+  avg_wind_speed <- df %>%
+    group_by(lat = lat, long = long) %>%
+    summarise(mean_wind_speed = mean(wind_speed, na.rm = TRUE))
+  
+  # Store the average wind speed values
+  wind_avg_list[[file]] <- avg_wind_speed
+ }
+```
+
+
+```{r}
+# Combine all average wind speeds into one data frame
+avg_wind_df <- bind_rows(wind_avg_list)
+
+# make it an sf object
+nrel_sf <- st_as_sf(avg_wind_df, coords = c("long", "lat"))
+
+# save it
+write_sf(nrel_sf, here("outputs", "intermediate_outputs", 
+                       "wind_site_suitability", "nrel_sf.shp"))
+
+nrel_sf <- read_sf(here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "nrel_sf.shp"))
+
+## check / transform nrel_sf CRS 
+if(st_crs(nrel_sf) == st_crs("EPSG: 4326")){
+  print("nrel_sf CRS is already WGS84")
+} else{
+  warning("Updated nrel_sf CRS to WGS84")
+  st_crs(nrel_sf) <- st_crs("EPSG: 4326")
+  nrel_sf <- st_transform(nrel_sf, st_crs("EPSG: 4326"))
+}
+
+# filter to WA state
+nrel_wa <- st_filter(nrel_sf, wa,
+                     .predicate = st_intersects)
+
+# save it
+write_sf(nrel_wa, here("outputs", "intermediate_outputs", 
+                       "wind_site_suitability", "nrel_wa.shp"))
+
+# read back in the saved nrel_wa vector instead of re-computing it
+nrel_wa <- read_sf(here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "nrel_wa.shp"))
+
+## check / transform CRS 
+if(st_crs(nrel_wa) == st_crs("EPSG: 4326")){
+  print("WA CRS is already WGS84")
+} else{
+  warning("Updated NREL CRS to WGS84")
+  st_crs(nrel_wa) <- st_crs("EPSG: 4326")
+}
+```
+
+#### Make the NREL raster
+```{r}
+# rasterize it
+nrel_raster <- terra::rasterize(nrel_wa, raster_template, 
+                           field = "mn_wnd_")
+
+# tinker with aggregation factor
+# aggregate it into a meaningful resolution
+nrel_agg <- terra::aggregate(nrel_raster, fact = 4, fun = "mean",
+                             na.rm = TRUE)
+
+# resample it to match the other rasters
+nrel_resampled <- terra::resample(x = nrel_agg, y = raster_template, 
+                                  method = "average")
+
+# Reclassify Wind Speed into Wind Potential
+## Miller and Li 2014 rcl table
+rcl_nrel <- matrix(c(0, 5.6, 0,
+                       5.6, 6.4, 1,
+                       6.4, 7, 2,
+                       7, 7.5, 3,
+                       7.5, 90, 4),
+               ncol=3, byrow=TRUE)
+## classify it
+nrel_final <- classify(nrel_resampled, rcl = rcl_nrel)
+
+## clean up the edges
+nrel_final <- mask(nrel_final, wa)
+
+## stats check
+cellSize(nrel_final)
+
+# save it
+terra::writeRaster(nrel_final, here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "nrel_final.tif"),
+                   overwrite = TRUE)
+
+# read back in the save raster
+nrel_final <- rast(here("outputs", "intermediate_outputs", 
+                       "wind_site_suitability", "nrel_final.tif"))
+
+map_wind_potential <- tm_shape(nrel_final)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Wind Energy Potential")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_potential, here("outputs", "intermediate_outputs", 
+                                   "wind_site_suitability", 
+                                   "map_wind_potential.png"))
+```
+
+### Distance to Transmission Lines
+```{r load & wrangle data, warning=TRUE}
+# read in power lines vector
+power_lines <- read_sf(here("data", "development_data", "US_Electric_Power_Transmission_Lines_2566740023388284220"))
+
+## check / transform power lines CRS 
+if(st_crs(power_lines) == st_crs("EPSG: 4326")){
+  print("Power lines CRS is already WGS84")
+} else{
+  warning("Updated power lines CRS to WGS84")
+  power_lines <- st_transform(power_lines, st_crs("EPSG: 4326"))
+}
+
+## crop power lines to WA
+power_lines <- st_filter(power_lines, wa, .predicate = st_within) %>% 
+  st_union()
+```
+
+
+```{r calculate raster of distances to transmission lines, execute=FALSE}
+# calculate distance to transmission lines column & join to centroid vector
+wa_centroids_1km$dist_to_power_lines <- st_distance(wa_centroids_1km, 
+                                                    power_lines)
+
+# add column for suitability bins by dist to power lines
+wa_centroids_pl <- wa_centroids_1km %>% 
+  mutate(dist_to_power_lines_no_units = drop_units(dist_to_power_lines),
+    power_lines_dist_bin = case_when(
+      dist_to_power_lines_no_units >= 0 
+      & dist_to_power_lines_no_units < 5000 ~ 4,
+      dist_to_power_lines_no_units >= 5000 
+      & dist_to_power_lines_no_units < 10000 ~ 3,
+      dist_to_power_lines_no_units >= 10000 
+      & dist_to_power_lines_no_units < 15000 ~ 2,
+      dist_to_power_lines_no_units >= 15000 
+      & dist_to_power_lines_no_units < 20000 ~ 1,
+      dist_to_power_lines_no_units >= 20000 ~ 0))
+
+# rasterize
+dist_to_power_lines <- terra::rasterize(wa_centroids_pl, raster_template, 
+                           field = "power_lines_dist_bin")
+
+# check / transform NLCD CRS 
+if(st_crs(dist_to_power_lines) == st_crs("EPSG: 4326")){
+  print("Distance to power lines CRS is already WGS84")
+} else{
+  warning("Updated distance to power lines CRS to WGS 84")
+  dist_to_power_lines <- project(dist_to_power_lines, "EPSG: 4326")
+}
+
+# save it
+writeRaster(dist_to_power_lines, here("outputs", "intermediate_outputs", "wind_site_suitability", "dist_to_power_lines.tif"), overwrite= TRUE)
+
+# load it
+dist_to_power_lines <- rast(here("outputs", "intermediate_outputs", 
+                                 "wind_site_suitability", 
+                                 "dist_to_power_lines.tif"))
+
+# map it
+map_dist_to_power_lines <- tm_shape(dist_to_power_lines)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Distance to Transmission Lines")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_dist_to_power_lines, here("outputs", "intermediate_outputs", "wind_site_suitability", "map_dist_to_power_lines.png"))
+```
+
+### Distance to Roads
+```{r load & wrangle data, warning=TRUE}
+# read in roads vector
+roads <- read_sf(here("data", "development_data", "tl_2023_53_prisecroads"))
+
+## check / transform roads CRS 
+if(st_crs(roads) == st_crs("EPSG: 4326")){
+  print("Roads CRS is already WGS84")
+} else{
+  warning("Updated roads CRS to WGS84")
+  roads <- st_transform(roads, st_crs("EPSG: 4326"))
+}
+
+## crop roads to WA
+roads <- st_filter(roads, wa, .predicate = st_within) %>% 
+  st_union()
+
+# calculate distances
+wa_centroids_pl$dist_to_roads <- st_distance(wa_centroids_pl, roads)
+
+# add column for suitability bins by dist to roads
+wa_centroids_final <- wa_centroids_pl %>% 
+  mutate(dist_to_roads_no_units = drop_units(dist_to_roads),
+    roads_dist_bin = case_when(
+      dist_to_roads_no_units >= 0 & dist_to_roads_no_units < 1000 ~ 4,
+      dist_to_roads_no_units >= 1000 & dist_to_roads_no_units < 2500 ~ 3,
+      dist_to_roads_no_units >= 2500 & dist_to_roads_no_units < 5000 ~ 2,
+      dist_to_roads_no_units >= 5000 & dist_to_roads_no_units < 10000 ~ 1, 
+      dist_to_roads_no_units >= 10000 ~ 0))
+
+## save it for later
+write_sf(wa_centroids_final, here("outputs", "intermediate_outputs", 
+                                  "templates", "centroids_final.shp"),
+         overwrite = TRUE)
+
+#  load pre-saved centroids shp
+wa_centroids_final <- read_sf(here("outputs", "intermediate_outputs", 
+                                   "templates", "centroids_final.shp"))
+
+# rasterize!
+dist_to_roads <- rasterize(wa_centroids_final, raster_template, 
+                           field = "rds_ds_")
+
+# save it
+writeRaster(dist_to_roads, here("outputs", "intermediate_outputs", 
+                                "wind_site_suitability", "dist_to_roads.tif"), 
+            overwrite = TRUE)
+
+# load it
+dist_to_roads <- rast(here("outputs", "intermediate_outputs", 
+                           "wind_site_suitability", "dist_to_roads.tif"))
+
+# check / transform distance to roads CRS 
+if(st_crs(dist_to_roads) == st_crs("EPSG: 4326")){
+  print("Dist to roads CRS is already WGS84")
+} else{
+  warning("Updated dist to roads CRS to WGS 84")
+  dist_to_roads <- project(dist_to_roads, "EPSG: 4326")
+}
+
+
+map_dist_to_roads <-  tm_shape(dist_to_roads)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Distance to Major Roads")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_dist_to_roads, here("outputs", "intermediate_outputs", 
+                                  "wind_site_suitability", 
+                                  "map_dist_to_roads.png"))
+```
+
+### Population Density
+
+```{r}
+census <- read_sf(here("data", "pop_dens", "tl_2020_53_tabblock20"))
+
+## check / transform census CRS 
+if(st_crs(census) == st_crs("EPSG: 4326")){
+  print("Census tract CRS is already WGS84")
+} else{
+  warning("Updated census CRS to WGS84")
+  census <- st_transform(census, st_crs("EPSG: 4326"))
+}
+
+# prep the vector data to be rasterized 
+pop <- census %>% 
+  mutate(sq_km = (ALAND20/1000000)) %>% # convert sq m to sq km
+  mutate(pop_density = (POP20 / sq_km)) %>% # calculate people per sq km
+  mutate(pop_density_bin = case_when( # categorize pop density ranges into bins
+      pop_density >= 0 & pop_density < 25 ~ 4,
+      pop_density >= 25 & pop_density < 50 ~ 3,
+      pop_density >= 50 & pop_density < 100 ~ 2,
+      pop_density >= 100 & pop_density < 150 ~ 1, 
+      pop_density >= 150 ~ 0))
+
+# rasterize the population vector data using the template
+pop_density <- rasterize(pop, raster_template, field = "pop_density_bin")
+
+# check / transform pop density CRS 
+if(st_crs(pop_density) == st_crs("EPSG: 4326")){
+  print("Pop density CRS is already WGS84")
+} else{
+  warning("Updated pop density CRS to WGS 84")
+  pop_density <- project(pop_density, "EPSG: 4326")
+}
+
+# save it
+writeRaster(pop_density, here("outputs", "intermediate_outputs", 
+                              "wind_site_suitability", "pop_density.tif"), 
+            overwrite = TRUE)
+
+# load it
+pop_density <- rast(here("outputs", "intermediate_outputs", 
+                              "wind_site_suitability", "pop_density.tif"))
+
+map_pop_density <-  tm_shape(pop_density)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Population Density")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+# save map
+tmap_save(map_pop_density, here("outputs", "intermediate_outputs", 
+                                "wind_site_suitability", "map_pop_density.png"))
+```
+
+### Land Cover
+```{r nlcd}
+nlcd <- rast(here("data", "development_data", "nlcd_new", "nlcd_new.tif"))
+
+# check / transform NLCD CRS 
+if(st_crs(nlcd) == st_crs("EPSG: 4326")){
+  print("Land Cover CRS is already WGS84")
+} else{
+  warning("Updated land cover CRS to WGS 84")
+  raster_template <- project(nlcd, "EPSG: 4326")
+}
+
+#nlcd <- st_crop(nlcd, wa)
+
+rcl_nlcd <- (matrix(c(0, 0,
+                  11, 0,
+                  12, 0,
+                  21, 0,
+                  22, 0,
+                  23, 0,
+                  24, 0,
+                  31, 4,
+                  41, 1,
+                  42, 1,
+                  43, 1,
+                  51, 2,
+                  52, 2,
+                  71, 3,
+                  72, 3,
+                  73, 3,
+                  74, 3,
+                  81, 4,
+                  82, 4,
+                  90, 0,
+                  95, 0,
+                  250, 0),
+               ncol=2, byrow=TRUE))
+
+reclassed_nlcd <- classify(nlcd, rcl = rcl_nlcd)
+
+wa_rast <- rasterize(wa, raster_template, field = NA)
+
+resampled_nlcd <- resample(x = reclassed_nlcd, y = raster_template, 
+                           method = "near")
+
+# mask it to WA
+
+land_cover <- terra::mask(resampled_nlcd, wa)
+
+# save it
+writeRaster(land_cover, here("outputs", "intermediate_outputs", 
+                             "wind_site_suitability", "land_cover.tif"), 
+            overwrite=TRUE)
+
+# load it
+land_cover <-rast(here("outputs", "intermediate_outputs", 
+                             "wind_site_suitability", "land_cover.tif"))
+
+map_land_cover <-  tm_shape(land_cover)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Land Cover")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+
+tmap_save(map_land_cover, here("outputs", "intermediate_outputs", 
+                               "wind_site_suitability", "map_land_cover.png"))
+```
+
+### Slope
+```{r load DEM data}
+dem01 <- rast(here("data", "usgs_dem", "USGS_1_n46w120_20130911.tif"))
+dem02 <- rast(here("data", "usgs_dem", "USGS_1_n46w120_20211004.tif"))
+dem03 <- rast(here("data", "usgs_dem", "USGS_1_n46w121_20180501.tif"))
+dem04 <- rast(here("data", "usgs_dem", "USGS_1_n46w121_20211129.tif"))
+dem05 <- rast(here("data", "usgs_dem", "USGS_1_n46w122_20171026.tif"))
+dem06 <- rast(here("data", "usgs_dem", "USGS_1_n46w122_20211129.tif"))
+dem07 <- rast(here("data", "usgs_dem", "USGS_1_n46w123_20211129.tif"))
+dem08 <- rast(here("data", "usgs_dem", "USGS_1_n47w117_20240401.tif"))
+dem09 <- rast(here("data", "usgs_dem", "USGS_1_n47w118_20211004.tif"))
+dem10 <- rast(here("data", "usgs_dem", "USGS_1_n47w119_20211004.tif"))
+dem11 <- rast(here("data", "usgs_dem", "USGS_1_n47w120_20211004.tif"))
+dem12 <- rast(here("data", "usgs_dem", "USGS_1_n47w121_20211129.tif"))
+dem13 <- rast(here("data", "usgs_dem", "USGS_1_n47w122_20211129.tif"))
+dem14 <- rast(here("data", "usgs_dem", "USGS_1_n47w123_20210615.tif"))
+dem15 <- rast(here("data", "usgs_dem", "USGS_1_n47w124_20211129.tif"))
+dem16 <- rast(here("data", "usgs_dem", "USGS_1_n47w125_20240327.tif"))
+dem17 <- rast(here("data", "usgs_dem", "USGS_1_n48w118_20210930.tif"))
+dem18 <- rast(here("data", "usgs_dem", "USGS_1_n48w119_20211004.tif"))
+dem19 <- rast(here("data", "usgs_dem", "USGS_1_n48w120_20220919.tif"))
+dem20 <- rast(here("data", "usgs_dem", "USGS_1_n48w121_20220919.tif"))
+dem21 <- rast(here("data", "usgs_dem", "USGS_1_n48w122_20210615.tif"))
+dem22 <- rast(here("data", "usgs_dem", "USGS_1_n48w123_20210615.tif"))
+dem23 <- rast(here("data", "usgs_dem", "USGS_1_n48w124_20220505.tif"))
+dem24 <- rast(here("data", "usgs_dem", "USGS_1_n48w125_20240327.tif"))
+dem25 <- rast(here("data", "usgs_dem", "USGS_1_n49w118_20210930.tif"))
+dem26 <- rast(here("data", "usgs_dem", "USGS_1_n49w119_20240617.tif"))
+dem27 <- rast(here("data", "usgs_dem", "USGS_1_n49w120_20220919.tif"))
+dem28 <- rast(here("data", "usgs_dem", "USGS_1_n49w121_20220919.tif"))
+dem29 <- rast(here("data", "usgs_dem", "USGS_1_n49w122_20220919.tif"))
+dem30 <- rast(here("data", "usgs_dem", "USGS_1_n49w123_20240327.tif"))
+dem31 <- rast(here("data", "usgs_dem", "USGS_1_n49w124_20240327.tif"))
+dem32 <- rast(here("data", "usgs_dem", "USGS_1_n49w125_20240327.tif"))
+
+slope_01 <- terra::terrain(dem01, v = "slope", neighbors = 8, unit = "degrees")
+slope_02 <- terra::terrain(dem02, v = "slope", neighbors = 8, unit = "degrees")
+slope_03 <- terra::terrain(dem03, v = "slope", neighbors = 8, unit = "degrees")
+slope_04 <- terra::terrain(dem04, v = "slope", neighbors = 8, unit = "degrees")
+slope_05 <- terra::terrain(dem05, v = "slope", neighbors = 8, unit = "degrees")
+slope_06 <- terra::terrain(dem06, v = "slope", neighbors = 8, unit = "degrees")
+slope_07 <- terra::terrain(dem07, v = "slope", neighbors = 8, unit = "degrees")
+slope_08 <- terra::terrain(dem08, v = "slope", neighbors = 8, unit = "degrees")
+slope_09 <- terra::terrain(dem09, v = "slope", neighbors = 8, unit = "degrees")
+slope_10 <- terra::terrain(dem10, v = "slope", neighbors = 8, unit = "degrees")
+slope_11 <- terra::terrain(dem11, v = "slope", neighbors = 8, unit = "degrees")
+slope_12 <- terra::terrain(dem12, v = "slope", neighbors = 8, unit = "degrees")
+slope_13 <- terra::terrain(dem13, v = "slope", neighbors = 8, unit = "degrees")
+slope_14 <- terra::terrain(dem14, v = "slope", neighbors = 8, unit = "degrees")
+slope_15 <- terra::terrain(dem15, v = "slope", neighbors = 8, unit = "degrees")
+slope_16 <- terra::terrain(dem16, v = "slope", neighbors = 8, unit = "degrees")
+slope_17 <- terra::terrain(dem17, v = "slope", neighbors = 8, unit = "degrees")
+slope_18 <- terra::terrain(dem18, v = "slope", neighbors = 8, unit = "degrees")
+slope_19 <- terra::terrain(dem19, v = "slope", neighbors = 8, unit = "degrees")
+slope_20 <- terra::terrain(dem20, v = "slope", neighbors = 8, unit = "degrees")
+slope_21 <- terra::terrain(dem21, v = "slope", neighbors = 8, unit = "degrees")
+slope_22 <- terra::terrain(dem22, v = "slope", neighbors = 8, unit = "degrees")
+slope_23 <- terra::terrain(dem23, v = "slope", neighbors = 8, unit = "degrees")
+slope_24 <- terra::terrain(dem24, v = "slope", neighbors = 8, unit = "degrees")
+slope_25 <- terra::terrain(dem25, v = "slope", neighbors = 8, unit = "degrees")
+slope_26 <- terra::terrain(dem26, v = "slope", neighbors = 8, unit = "degrees")
+slope_27 <- terra::terrain(dem27, v = "slope", neighbors = 8, unit = "degrees")
+slope_28 <- terra::terrain(dem28, v = "slope", neighbors = 8, unit = "degrees")
+slope_29 <- terra::terrain(dem29, v = "slope", neighbors = 8, unit = "degrees")
+slope_30 <- terra::terrain(dem30, v = "slope", neighbors = 8, unit = "degrees")
+slope_31 <- terra::terrain(dem31, v = "slope", neighbors = 8, unit = "degrees")
+slope_32 <- terra::terrain(dem32, v = "slope", neighbors = 8, unit = "degrees")
+
+wa_slope <- merge(slope_01, slope_02, slope_03, slope_04, slope_05, slope_06, 
+                  slope_07, slope_08, slope_09, slope_10, slope_11, slope_11, 
+                  slope_12, slope_13, slope_14, slope_15, slope_16, slope_17, 
+                  slope_18, slope_19, slope_20, slope_21, slope_22, slope_23, 
+                  slope_24, slope_25, slope_26, slope_27, slope_28, slope_29, 
+                  slope_30, slope_31, slope_32)
+
+wa_slope_resampled <- resample(wa_slope, raster_template)
+
+# Reclassify slope based on values from Miller and Li 2014
+rcl_slope <- matrix(c(0, 7, 4,
+                       7, 16, 3,
+                       16, 30, 2,
+                       30, 40, 1,
+                       40, 90, 0),
+               ncol=3, byrow=TRUE)
+
+slope <- classify(wa_slope_resampled, rcl = rcl_slope)
+
+# check / transform slope CRS 
+if(st_crs(slope) == st_crs("EPSG: 4326")){
+  print("Slope CRS is already WGS84")
+} else{
+  warning("Updated slope CRS to WGS 84")
+  slope <- project(slope, "EPSG: 4326")
+}
+
+# mask slope raster to Washington State
+slope <- mask(slope, wa)
+
+# save it
+writeRaster(slope, here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "slope.tif"), 
+            overwrite = TRUE)
+
+# load it
+slope <- rast(here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "slope.tif"))
+
+map_slope <-  tm_shape(slope)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,,
+            labels = c("0", "1", "2", "3", "4"),
+            title = "Suitability Score")+
+  tm_layout(legend.position = c("left", "bottom"),
+            main.title = "Site Suitability by Slope Angle")+
+  tm_compass(position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+
+tmap_save(map_slope, here("outputs", "intermediate_outputs", 
+                          "wind_site_suitability", "map_slope.png"))
+```
+
+## Wind Energy Site Suitability Raster
+```{r load presaved rasters}
+# load presaved rasters
+
+wind_potential <- rast(here("outputs", "intermediate_outputs", 
+                            "wind_site_suitability", "nrel_final.tif"))
+
+dist_to_power_lines <- rast(here("outputs", "intermediate_outputs", 
+                                 "wind_site_suitability", "dist_to_power_lines.tif"))
+
+dist_to_roads <- rast(here("outputs", "intermediate_outputs", 
+                           "wind_site_suitability", "dist_to_roads.tif"))
+
+slope <- rast(here("outputs", "intermediate_outputs", "wind_site_suitability", 
+                   "slope.tif"))
+
+pop_density <- rast(here("outputs", "intermediate_outputs", 
+                         "wind_site_suitability", "pop_density.tif"))
+
+land_cover <- rast(here("outputs", "intermediate_outputs", 
+                        "wind_site_suitability", "land_cover.tif"))
+
+# stack rasters
+wind_site_suitability_unweighted <- c(wind_potential, dist_to_power_lines, 
+                                      dist_to_roads, slope, land_cover, 
+                                      pop_density)
+
+# calculate weighted mean
+wind_site_suitability <- weighted.mean(wind_site_suitability_unweighted, 
+                                       w = c(3, 2, 2, 2, 2, 1))
+
+# save raster
+writeRaster(wind_site_suitability, here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability.tif"), overwrite = TRUE)
+
+#load it
+wind_site_suitability <- rast(here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability.tif"))
+
+# map
+map_wind_site_suitability <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_site_suitability)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Site Suitability",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_site_suitability, here("outputs", "intermediate_outputs", "wind_site_suitability", "map_wind_site_suitability.png"))
+```
+
+
+## Excluded Areas
+### Component Variables
+#### Urban Centers
+```{r load & wrangle data, warning=TRUE}
+# read in urban areas vector
+urban <- read_sf(here("data", "development_data", "tl_2023_us_uac20"))
+
+## check / transform urban areas CRS 
+if(st_crs(urban) == st_crs("EPSG: 4326")){
+  print("Urban centers CRS is already WGS84")
+} else{
+  warning("Updated urban centers CRS to WGS84")
+  urban <- st_transform(urban, st_crs("EPSG: 4326"))
+}
+
+## crop urban areas to WA
+urban <- st_filter(urban, wa, .predicate = st_within)
+
+# buffer urban areas by 1600m
+urban_buffer <- st_buffer(urban, 1600)
+
+# save it
+write_sf(urban_buffer, here("outputs", "intermediate_outputs", 
+                            "wind_site_suitability", "urban_buffer.shp"))
+
+# read back in the saved file
+urban_buffer <- read_sf(here("outputs", "intermediate_outputs", 
+                             "wind_site_suitability", "urban_buffer.shp"))
+
+map_urban_buffer <- tm_shape(wa_border)+
+  tm_borders()+
+  tm_shape(urban_buffer)+
+  tm_polygons(col = "red")+
+  tm_layout(main.title = "1600m Buffer Around Urban Areas")
+
+tmap_save(map_urban_buffer, here("outputs", "intermediate_outputs", 
+                                 "wind_site_suitability", 
+                                 "map_urban_buffer.png"))
+```
+
+#### Railroads Buffer
+```{r load & wrangle data, warning=TRUE}
+# read in railroads vector
+railroads <- read_sf(here("data", "development_data", "tl_2023_us_rails")) 
+
+## check / transform railroads CRS 
+if(st_crs(railroads) == st_crs("EPSG: 4326")){
+  print("Railoads CRS is already WGS84")
+} else{
+  warning("Updated railroads CRS to WGS84")
+  railroads <- st_transform(railroads, st_crs("EPSG: 4326"))
+}
+
+# cut to wa state
+railroads <- st_filter(railroads, wa, 
+                       .predicate = st_intersects)
+
+## buffer railroads by 100m
+railroads_buffer <- st_buffer(railroads, 100)
+
+# dissolve boundaries
+#railroads_buffer <- st_union(railroads_buffer) %>%
+#  st_make_valid(railroads_buffer)
+
+# save it
+write_sf(railroads_buffer, here("outputs", "intermediate_outputs", 
+                                "wind_site_suitability", "railroads_buffer.shp"))
+
+# read back in the saved file
+railroads_buffer <- read_sf(here("outputs", "intermediate_outputs", 
+                                 "wind_site_suitability", "railroads_buffer.shp"))
+
+# map
+map_railroad_buffer <- tm_shape(wa_border)+
+  tm_borders()+
+  tm_shape(railroads_buffer)+
+  tm_borders(col = "red")+
+  tm_layout(main.title = "100m Buffer Around Railroads")
+
+tmap_save(map_railroad_buffer, here("outputs", "intermediate_outputs", 
+                                    "wind_site_suitability", 
+                                    "map_railroad_buffer.png"))
+```
+
+#### Roads Buffer 
+```{r load & wrangle data, warning=TRUE}
+# read in roads vector
+roads <- read_sf(here("data", "development_data", 
+                             "tl_2023_53_prisecroads"))
+
+## check / transform roads CRS 
+if(st_crs(roads) == st_crs("EPSG: 4326")){
+  print("Roads CRS is already WGS84")
+} else{
+  warning("Updated roads  CRS to WGS84")
+  roads <- st_transform(roads, st_crs("EPSG: 4326"))
+}
+
+## buffer roads by 100m
+roads_buffer <- st_buffer(roads, 100)
+
+
+
+
+# this seemed to be breaking the code, but maybe I'm wrong
+# dissolve boundaries
+# roads_buffer <- st_union(roads_buffer)
+# roads_buffer <- st_make_valid(roads_buffer)
+
+# save it
+write_sf(roads_buffer, here("outputs", "intermediate_outputs", 
+                            "wind_site_suitability", "roads_buffer.shp"))
+
+# read back in the saved file
+roads_buffer <- read_sf(here("outputs", "intermediate_outputs", 
+                             "wind_site_suitability", "roads_buffer.shp"))
+
+# map
+map_roads_buffer <- tm_shape(wa_border)+
+  tm_borders()+
+  tm_shape(roads_buffer)+
+  tm_borders(col = "red")+
+  tm_layout(main.title = "100m Buffer Around Roads")
+
+tmap_save(map_roads_buffer, here("outputs", "intermediate_outputs", 
+                                 "wind_site_suitability", 
+                                 "map_roads_buffer.png"))
+```
+
+#### Protected Areas
+```{r}
+# read in shp
+pad <- read_sf(here("data", "development_data", "pad", "pad.shp")) %>% 
+  st_make_valid() %>% 
+  filter(d_GAP_Sts == "2 - managed for biodiversity - disturbance events suppressed" 
+         | d_GAP_Sts == "1 - managed for biodiversity - disturbance events proceed or are mimicked")
+
+## check / transform railroads CRS 
+if(st_crs(pad) == st_crs("EPSG: 4326")){
+  print("Protected Area Designation CRS is already WGS84")
+} else{
+  warning("Updated Protected Area Designation CRS to WGS84")
+  pad <- st_transform(pad, st_crs("EPSG: 4326"))
+}
+
+# save it
+write_sf(pad, here("outputs", "intermediate_outputs", 
+                   "wind_site_suitability", "pad.shp"))
+
+# read back in the saved file
+pad <- read_sf(here("outputs", "intermediate_outputs", 
+                    "wind_site_suitability", "pad.shp"))
+
+# map
+map_protected_areas <- tm_shape(wa_border)+
+  tm_borders()+
+  tm_shape(pad)+
+  tm_polygons(col = "red")+
+  tm_layout(main.title = "Protected Areas")
+
+tmap_save(map_protected_areas, here("outputs", "intermediate_outputs", 
+                                    "wind_site_suitability", 
+                                    "map_protected_areas.png"))
+```
+
+#### Airports
+```{r load & wrangle data, warning=TRUE}
+# read in airports vector
+airports <- read_sf(here("data", "development_data", "airports", "WSDOT_-_Aviation_Non-Military_Airports.shp"))
+
+## check / transform airports CRS 
+if(st_crs(airports) == st_crs("EPSG: 4326")){
+  print("Airports CRS is already WGS84")
+} else{
+  warning("Updated airports CRS to WGS84")
+  airports <- st_transform(airports, st_crs("EPSG: 4326"))
+}
+
+# buffer airports
+airports_buffer <- st_buffer(airports, 1600)
+
+# save it
+write_sf(airports_buffer, here("outputs", "intermediate_outputs", 
+                               "wind_site_suitability", "airports_buffer.shp"))
+
+# read back in the saved file
+airports_buffer <- read_sf(here("outputs", "intermediate_outputs", 
+                                "wind_site_suitability", "airports_buffer.shp"))
+
+# map
+map_airports_buffer <- tm_shape(wa_border)+
+  tm_borders()+
+  tm_shape(airports_buffer)+
+  tm_polygons(col = "red")+
+  tm_layout(main.title = "1600m Buffer Around Airports")
+
+tmap_save(map_airports_buffer, here("outputs", "intermediate_outputs", 
+                                    "wind_site_suitability", "map_airports_buffer.png"))
+```
+
+### Mask out Excluded Areas
+```{r}
+wind_site_suitability_masked <- rast(here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability.tif"))
+
+wind_site_suitability_masked <- mask(wind_site_suitability_masked, 
+                                     urban_buffer, inverse = TRUE)
+wind_site_suitability_masked <- mask(wind_site_suitability_masked, 
+                                     railroads_buffer, inverse = TRUE)
+wind_site_suitability_masked <- mask(wind_site_suitability_masked, 
+                                     roads_buffer, inverse = TRUE)
+wind_site_suitability_masked <- mask(wind_site_suitability_masked, 
+                                     airports_buffer, inverse = TRUE)
+wind_site_suitability_masked <- mask(wind_site_suitability_masked, 
+                                     pad, inverse = TRUE)
+
+# save it
+writeRaster(wind_site_suitability_masked, here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability_masked.tif"))
+
+# load it
+wind_site_suitability_masked <- rast(here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability_masked.tif"))
+
+
+map_wind_site_suitability_masked <- tm_shape(wa_border)+
+  tm_polygons(col = "black")+
+  tm_shape(wind_site_suitability_masked)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_layout(legend.outside = TRUE,
+            main.title = "Wind Energy Site Suitability with Excluded Areas")
+
+tmap_save(map_wind_site_suitability_masked, here("outputs", 
+                                                 "intermediate_outputs",
+                                                 "wind_site_suitability", 
+                                                 "map_wind_site_suitability_masked.png"))
+```
+
+### Compare to Existing Turbine Locations
+```{r}
+turbines <- read_sf(here("data", "turbines", "uswtdb_v7_2_20241120.shp"))
+
+## check / transform turbines CRS 
+if(st_crs(turbines) == st_crs("EPSG: 4326")){
+  print("turbines CRS is already WGS84")
+} else{
+  warning("Updated turbines CRS to WGS84")
+  turbines <- st_transform(turbines, st_crs("EPSG: 4326"))
+}
+
+turbines_wa <- st_filter(turbines, wa,
+                         .predicate = st_intersects)
+
+map_wind_site_suitability_with_turbines <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+tm_shape(wind_site_suitability_masked)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(turbines_wa)+
+  tm_symbols(shape = 24,
+             col = "black",
+             border.lwd = 0.001,
+             border.col = "black",
+             size = 0.01)+
+  tm_layout(main.title = "Wind Energy Site Suitability with Existing Turbines",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_site_suitability_with_turbines, here("outputs", 
+                                                        "intermediate_outputs",
+                                                        "wind_site_suitability",
+                                                 "map_wind_site_suitability_with_turbines.png"))
+```
+
+
+# Part 2: Species Distribution Models
+## Environmental Variables
+### Solar Radiation
+```{r read in solrad rasters}
+solrad_01 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_01.tif"))
+
+solrad_02 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_02.tif"))
+
+solrad_03 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_03.tif"))
+
+solrad_04 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_04.tif"))
+
+solrad_05 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_05.tif"))
+
+solrad_06 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_06.tif"))
+
+solrad_07 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_07.tif"))
+
+solrad_08 <- rast(here("data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_08.tif"))
+
+solrad_09 <- rast(here("data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_09.tif"))
+
+solrad_10 <- rast(here("data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_10.tif"))
+
+solrad_11 <- rast(here("data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_09.tif"))
+
+solrad_12 <- rast(here( "data", "env_data", "wc2.1_30s_srad", "wc2.1_30s_srad_12.tif"))
+```
+
+```{r crop solrad rasters}
+wa_solrad_01 <- terra::crop(solrad_01, wa, mask = TRUE)
+
+wa_solrad_02 <- terra::crop(solrad_02, wa, mask = TRUE)
+
+wa_solrad_03 <- terra::crop(solrad_03, wa, mask = TRUE)
+
+wa_solrad_04 <- terra::crop(solrad_04, wa, mask = TRUE)
+
+wa_solrad_05 <- terra::crop(solrad_05, wa, mask = TRUE)
+
+wa_solrad_06 <- terra::crop(solrad_06, wa, mask = TRUE)
+
+wa_solrad_07 <- terra::crop(solrad_07, wa, mask = TRUE)
+
+wa_solrad_08 <- terra::crop(solrad_08, wa, mask = TRUE)
+
+wa_solrad_09 <- terra::crop(solrad_09, wa, mask = TRUE)
+
+wa_solrad_10 <- terra::crop(solrad_10, wa, mask = TRUE)
+
+wa_solrad_11 <- terra::crop(solrad_11, wa, mask = TRUE)
+
+wa_solrad_12 <- terra::crop(solrad_12, wa, mask = TRUE)
+```
+
+```{r aggregate solrad into seasons}
+solrad_fall <- mean(wa_solrad_08, wa_solrad_09, wa_solrad_10) 
+
+solrad_winter <- mean(wa_solrad_11, wa_solrad_12, wa_solrad_01) 
+
+solrad_spring <- mean(wa_solrad_02, wa_solrad_03, wa_solrad_04) 
+
+solrad_summer <- mean(wa_solrad_05, wa_solrad_06, wa_solrad_07) 
+```
+
+```{r seasonal solrad maps}
+map_solrad_spring <- tm_shape(solrad_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(solrad_spring)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kJ / m^2 / day)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Spring Solar Radiation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_solrad_spring, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_solrad_spring.png"))
+
+map_solrad_summer <- tm_shape(solrad_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(solrad_summer)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kJ / m^2 / day)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Summer Solar Radiation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_solrad_summer, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_solrad_summer.png"))
+
+map_solrad_fall <- tm_shape(solrad_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(solrad_fall)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kJ / m^2 / day)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Fall Solar Radiation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_solrad_fall, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_solrad_fall.png"))
+
+map_solrad_winter <- tm_shape(solrad_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(solrad_winter)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kJ / m^2 / day)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Winter Solar Radiation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_solrad_winter, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_solrad_winter.png"))
+```
+
+
+```{r save seasonal solrad rasters}
+writeRaster(solrad_fall, here("data", "env_data", "seasonal_env_data", "solrad_fall.tif"), overwrite=TRUE)
+
+writeRaster(solrad_winter, here("data", "env_data", "seasonal_env_data", "solrad_winter.tif"), overwrite=TRUE)
+
+writeRaster(solrad_spring, here("data", "env_data", "seasonal_env_data", "solrad_spring.tif"), overwrite=TRUE)
+
+writeRaster(solrad_summer, here("data", "env_data", "seasonal_env_data", "solrad_summer.tif"), overwrite=TRUE)
+```
+
+### Precipitation
+```{r read in precip rasters}
+precip_01 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_01.tif"))
+
+precip_02 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_02.tif"))
+
+precip_03 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_03.tif"))
+
+precip_04 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_04.tif"))
+
+precip_05 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_05.tif"))
+
+precip_06 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_06.tif"))
+
+precip_07 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_07.tif"))
+
+precip_08 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_08.tif"))
+
+precip_09 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_09.tif"))
+
+precip_10 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_10.tif"))
+
+precip_11 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_11.tif"))
+
+precip_12 <- rast(here( "data", "env_data", "wc2.1_30s_prec", "wc2.1_30s_prec_12.tif"))
+```
+
+```{r crop precip rasters}
+wa_precip_01 <- terra::crop(precip_01, wa, mask= TRUE)
+
+wa_precip_02 <- terra::crop(precip_02, wa, mask= TRUE)
+
+wa_precip_03 <- terra::crop(precip_03, wa, mask= TRUE)
+
+wa_precip_04 <- terra::crop(precip_04, wa, mask= TRUE)
+
+wa_precip_05 <- terra::crop(precip_05, wa, mask= TRUE)
+
+wa_precip_06 <- terra::crop(precip_06, wa, mask= TRUE)
+
+wa_precip_07 <- terra::crop(precip_07, wa, mask= TRUE)
+
+wa_precip_08 <- terra::crop(precip_08, wa, mask= TRUE)
+
+wa_precip_09 <- terra::crop(precip_09, wa, mask= TRUE)
+
+wa_precip_10 <- terra::crop(precip_10, wa, mask= TRUE)
+
+wa_precip_11 <- terra::crop(precip_11, wa, mask= TRUE)
+
+wa_precip_12 <- terra::crop(precip_12, wa, mask= TRUE)
+```
+
+```{r aggregate precip into seasons}
+precip_fall <- mean(wa_precip_08, wa_precip_09, wa_precip_10) 
+
+precip_winter <- mean(wa_precip_11, wa_precip_12, wa_precip_01) 
+
+precip_spring <- mean(wa_precip_02, wa_precip_03, wa_precip_04) 
+
+precip_summer <- mean(wa_precip_05, wa_precip_06, wa_precip_07) 
+```
+
+```{r prelim precip maps}
+map_precip_spring <- tm_shape(precip_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(precip_spring)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(mm)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Spring Precipitation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_precip_spring, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_precip_spring.png"))
+
+map_precip_summer <- tm_shape(precip_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(precip_summer)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(mm)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Summer Precipitation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_precip_summer, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_precip_summer.png"))
+
+map_precip_fall <- tm_shape(precip_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(precip_fall)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(mm)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Fall Precipitation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_precip_fall, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_precip_fall.png"))
+
+map_precip_winter <- tm_shape(precip_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(precip_winter)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(mm)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Winter Precipitation",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_precip_winter, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_precip_winter.png"))
+```
+
+```{r save seasonal precip rasters}
+writeRaster(precip_fall, here( "data", "env_data", "seasonal_env_data", "precip_fall.tif"), overwrite=TRUE)
+
+writeRaster(precip_winter, here( "data", "env_data", "seasonal_env_data", "precip_winter.tif"), overwrite=TRUE)
+
+writeRaster(precip_spring, here( "data", "env_data", "seasonal_env_data", "precip_spring.tif"), overwrite=TRUE)
+
+writeRaster(precip_summer, here( "data", "env_data", "seasonal_env_data", "precip_summer.tif"), overwrite=TRUE)
+```
+
+### Wind Speed
+```{r read in wind speed rasters}
+wind_01 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_01.tif"))
+
+wind_02 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_02.tif"))
+
+wind_03 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_03.tif"))
+
+wind_04 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_04.tif"))
+
+wind_05 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_05.tif"))
+
+wind_06 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_06.tif"))
+
+wind_07 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_07.tif"))
+
+wind_08 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_08.tif"))
+
+wind_09 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_09.tif"))
+
+wind_10 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_10.tif"))
+
+wind_11 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_11.tif"))
+
+wind_12 <- rast(here( "data", "env_data", "wc2.1_30s_wind", "wc2.1_30s_wind_12.tif"))
+```
+
+```{r crop wind speed rasters}
+wa_wind_01 <- terra::crop(wind_01, wa, mask = TRUE)
+
+wa_wind_02 <- terra::crop(wind_02, wa, mask = TRUE)
+
+wa_wind_03 <- terra::crop(wind_03, wa, mask = TRUE)
+
+wa_wind_04 <- terra::crop(wind_04, wa, mask = TRUE)
+
+wa_wind_05 <- terra::crop(wind_05, wa, mask = TRUE)
+
+wa_wind_06 <- terra::crop(wind_06, wa, mask = TRUE)
+
+wa_wind_07 <- terra::crop(wind_07, wa, mask = TRUE)
+
+wa_wind_08 <- terra::crop(wind_08, wa, mask = TRUE)
+
+wa_wind_09 <- terra::crop(wind_09, wa, mask = TRUE)
+
+wa_wind_10 <- terra::crop(wind_10, wa, mask = TRUE)
+
+wa_wind_11 <- terra::crop(wind_11, wa, mask = TRUE)
+
+wa_wind_12 <- terra::crop(wind_12, wa, mask = TRUE)
+```
+
+```{r aggregate wind speed into seasons}
+wind_fall <- mean(wa_wind_08, wa_wind_09, wa_wind_10) 
+
+wind_winter <- mean(wa_wind_11, wa_wind_12, wa_wind_01) 
+
+wind_spring <- mean(wa_wind_02, wa_wind_03, wa_wind_04) 
+
+wind_summer <- mean(wa_wind_05, wa_wind_06, wa_wind_07) 
+```
+
+```{r prelim wind speed maps}
+map_wind_spring <- tm_shape(wind_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_spring)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(m / sec)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Spring Wind Speed",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_spring, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_wind_spring.png"))
+
+map_wind_summer <- tm_shape(wind_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_summer)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(m / sec)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Summer Wind Speed",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_summer, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_wind_summer.png"))
+
+map_wind_fall <- tm_shape(wind_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_fall)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(m / sec)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Fall Wind Speed",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_fall, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_wind_fall.png"))
+
+map_wind_winter <- tm_shape(wind_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_winter)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(m / sec)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Winter Wind Speed",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_winter, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_wind_winter.png"))
+```
+
+```{r save seasonal wind speed rasters}
+writeRaster(wind_fall, here("data", "env_data", "seasonal_env_data", "wind_fall.tif"), overwrite=TRUE)
+
+writeRaster(wind_winter, here("data", "env_data", "seasonal_env_data", "wind_winter.tif"), overwrite=TRUE)
+
+writeRaster(wind_spring, here("data", "env_data", "seasonal_env_data",  "wind_spring.tif"), overwrite=TRUE)
+
+writeRaster(wind_summer, here("data", "env_data", "seasonal_env_data",  "wind_summer.tif"), overwrite=TRUE)
+```
+
+### Vapor Pressure
+```{r}
+vapr_01 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_01.tif"))
+
+vapr_02 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_02.tif"))
+
+vapr_03 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_03.tif"))
+
+vapr_04 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_04.tif"))
+
+vapr_05 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_05.tif"))
+
+vapr_06 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_06.tif"))
+
+vapr_07 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_07.tif"))
+
+vapr_08 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_08.tif"))
+
+vapr_09 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_09.tif"))
+
+vapr_10 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_10.tif"))
+
+vapr_11 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_11.tif"))
+
+vapr_12 <- rast(here( "data", "env_data", "wc2.1_30s_vapr", "wc2.1_30s_vapr_12.tif"))
+```
+
+```{r crop vapor pressure rasters}
+wa_vapr_01 <- terra::crop(vapr_01, wa, mask = TRUE)
+
+wa_vapr_02 <- terra::crop(vapr_02, wa, mask = TRUE)
+
+wa_vapr_03 <- terra::crop(vapr_03, wa, mask = TRUE)
+
+wa_vapr_04 <- terra::crop(vapr_04, wa, mask = TRUE)
+
+wa_vapr_05 <- terra::crop(vapr_05, wa, mask = TRUE)
+
+wa_vapr_06 <- terra::crop(vapr_06, wa, mask = TRUE)
+
+wa_vapr_07 <- terra::crop(vapr_07, wa, mask = TRUE)
+
+wa_vapr_08 <- terra::crop(vapr_08, wa, mask = TRUE)
+
+wa_vapr_09 <- terra::crop(vapr_09, wa, mask = TRUE)
+
+wa_vapr_10 <- terra::crop(vapr_10, wa, mask = TRUE)
+
+wa_vapr_11 <- terra::crop(vapr_11, wa, mask = TRUE)
+
+wa_vapr_12 <- terra::crop(vapr_12, wa, mask = TRUE)
+```
+
+```{r aggregate vapor pressure into seasons}
+vapr_fall <- mean(wa_vapr_08, wa_vapr_09, wa_vapr_10) 
+
+vapr_winter <- mean(wa_vapr_11, wa_vapr_12, wa_vapr_01) 
+
+vapr_spring <- mean(wa_vapr_02, wa_vapr_03, wa_vapr_04) 
+
+vapr_summer <- mean(wa_vapr_05, wa_vapr_06, wa_vapr_07) 
+```
+
+```{r prelim vapor pressure maps}
+map_vapr_spring <- tm_shape(vapr_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(vapr_spring)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kPa)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Spring Vapor Pressure",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_vapr_spring, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_vapr_spring.png"))
+
+map_vapr_summer <- tm_shape(vapr_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(vapr_summer)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kPa)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Summer Vapor Pressure",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_vapr_summer, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_vapr_summer.png"))
+
+map_vapr_fall <- tm_shape(vapr_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(vapr_fall)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kPa)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Fall Vapor Pressure",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_vapr_fall, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_vapr_fall.png"))
+
+map_vapr_winter <- tm_shape(vapr_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(vapr_winter)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(kPa)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Winter Vapor Pressure",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_vapr_winter, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_vapr_winter.png"))
+```
+
+```{r save seasonal vapor pressure rasters}
+writeRaster(vapr_fall, here("data", "env_data", "seasonal_env_data", "vapr_fall.tif"), overwrite=TRUE)
+
+writeRaster(vapr_winter, here("data", "env_data", "seasonal_env_data", "vapr_winter.tif"), overwrite=TRUE)
+
+writeRaster(vapr_spring, here("data", "env_data", "seasonal_env_data", "vapr_spring.tif"), overwrite=TRUE)
+
+writeRaster(vapr_summer, here("data", "env_data", "seasonal_env_data", "vapr_summer.tif"), overwrite=TRUE)
+```
+
+### Air Temperature
+```{r read in air temp rasters}
+tavg_01 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_01.tif"))
+
+tavg_02 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_02.tif"))
+
+tavg_03 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_03.tif"))
+
+tavg_04 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_04.tif"))
+
+tavg_05 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_05.tif"))
+
+tavg_06 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_06.tif"))
+
+tavg_07 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_07.tif"))
+
+tavg_08 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_08.tif"))
+
+tavg_09 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_09.tif"))
+
+tavg_10 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_10.tif"))
+
+tavg_11 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_11.tif"))
+
+tavg_12 <- rast(here( "data", "env_data", "wc2.1_30s_tavg", "wc2.1_30s_tavg_12.tif"))
+```
+
+```{r crop air temp rasters}
+wa_tavg_01 <- terra::crop(tavg_01, wa, mask = TRUE)
+
+wa_tavg_02 <- terra::crop(tavg_02, wa, mask = TRUE)
+
+wa_tavg_03 <- terra::crop(tavg_03, wa, mask = TRUE)
+
+wa_tavg_04 <- terra::crop(tavg_04, wa, mask = TRUE)
+
+wa_tavg_05 <- terra::crop(tavg_05, wa, mask = TRUE)
+
+wa_tavg_06 <- terra::crop(tavg_06, wa, mask = TRUE)
+
+wa_tavg_07 <- terra::crop(tavg_07, wa, mask = TRUE)
+
+wa_tavg_08 <- terra::crop(tavg_08, wa, mask = TRUE)
+
+wa_tavg_09 <- terra::crop(tavg_09, wa, mask = TRUE)
+
+wa_tavg_10 <- terra::crop(tavg_10, wa, mask = TRUE)
+
+wa_tavg_11 <- terra::crop(tavg_11, wa, mask = TRUE)
+
+wa_tavg_12 <- terra::crop(tavg_12, wa, mask = TRUE)
+```
+
+```{r aggregate air temp rasters into seasons}
+tavg_fall <- mean(wa_tavg_08, wa_tavg_09, wa_tavg_10) 
+
+tavg_winter <- mean(wa_tavg_11, wa_tavg_12, wa_tavg_01) 
+
+tavg_spring <- mean(wa_tavg_02, wa_tavg_03, wa_tavg_04) 
+
+tavg_summer <- mean(wa_tavg_05, wa_tavg_06, wa_tavg_07) 
+```
+
+```{r prelim air temp maps}
+map_tavg_spring <- tm_shape(tavg_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(tavg_spring)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(Celsius)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Spring Air Temperature",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_tavg_spring, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_tavg_spring.png"))
+
+map_tavg_summer <- tm_shape(tavg_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(tavg_summer)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(Celsius)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Summer Air Temperature",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_tavg_summer, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_tavg_summer.png"))
+
+map_tavg_fall <- tm_shape(tavg_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(tavg_fall)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(Celsius)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Fall Air Temperature",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_tavg_fall, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_tavg_fall.png"))
+
+map_tavg_winter <- tm_shape(tavg_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(tavg_winter)+
+  tm_raster(style = "cont",
+            palette = map_palette,
+            title = "(Celsius)")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Mean Winter Air Temperature",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_tavg_winter, here("outputs", "intermediate_outputs", "seasonal_env_rasters", "map_tavg_winter.png"))
+```
+
+```{r save seasonal air temperature rasters}
+writeRaster(tavg_fall, here("data", "env_data", "seasonal_env_data", "tavg_fall.tif"), overwrite=TRUE)
+
+writeRaster(tavg_winter, here("data", "env_data", "seasonal_env_data", "tavg_winter.tif"), overwrite=TRUE)
+
+writeRaster(tavg_spring, here("data", "env_data", "seasonal_env_data", "tavg_spring.tif"), overwrite=TRUE)
+
+writeRaster(tavg_summer, here("data", "env_data", "seasonal_env_data", "tavg_summer.tif"), overwrite=TRUE)
+```
+
+## Run Wallace
+```{r}
+#run_wallace()
+```
+
+```{r}
+# Load pre-saved SDM rasters
+laci_spring <- rast(here("outputs", "intermediate_outputs", "wallace", "laci_spring.tif")) %>% 
+  crop(., wa, mask=TRUE)
+laci_summer <- rast(here("outputs", "intermediate_outputs", "wallace", "laci_summer.tif")) %>% 
+  crop(., wa, mask=TRUE)
+laci_fall <- rast(here("outputs", "intermediate_outputs", "wallace", "laci_fall.tif")) %>% 
+  crop(., wa, mask=TRUE)
+laci_winter <- rast(here("outputs", "intermediate_outputs", "wallace", "laci_winter.tif")) %>% 
+  crop(., wa, mask=TRUE)
+
+lano_spring <- rast(here("outputs", "intermediate_outputs", "wallace", "lano_spring.tif")) %>% 
+  crop(., wa, mask=TRUE)
+lano_summer <- rast(here("outputs", "intermediate_outputs", "wallace", "lano_summer.tif")) %>% 
+  crop(., wa, mask=TRUE)
+lano_fall <- rast(here("outputs", "intermediate_outputs", "wallace", "lano_fall.tif")) %>% 
+  crop(., wa, mask=TRUE)
+lano_winter <- rast(here("outputs", "intermediate_outputs", "wallace", "lano_winter.tif")) %>% 
+  crop(., wa, mask=TRUE)
+```
+
+
+## Reclassify SDM rasters into suitability scores 0-4
+```{r}
+# Reclassify SDMs based on suitability
+rcl_sdm <- matrix(c(0, 0.01, 0,
+                    0.01, 0.25, 1,
+                    0.25, 0.5, 2,
+                    0.5, 0.75, 3,
+                    0.75, 1, 4),
+               ncol=3, byrow=TRUE)
+
+# Reclassify Hoary bat SDMs
+laci_spring_score <- classify(laci_spring, rcl = rcl_sdm)
+laci_summer_score <- classify(laci_summer, rcl = rcl_sdm)
+laci_fall_score <- classify(laci_fall, rcl = rcl_sdm)
+laci_winter_score <- classify(laci_winter, rcl = rcl_sdm)
+
+# Reclassify Silver-Haired Bat SDMs
+lano_spring_score <- classify(lano_spring, rcl = rcl_sdm)
+lano_summer_score <- classify(lano_summer, rcl = rcl_sdm)
+lano_fall_score <- classify(lano_fall, rcl = rcl_sdm)
+lano_winter_score <- classify(lano_winter, rcl = rcl_sdm)
+```
+
+## Make a raster & map of maximum SDM scores across species and seasons
+```{r}
+
+both_max_score <- max(lano_spring_score, lano_summer_score, 
+                      lano_fall_score, lano_winter_score, 
+                      laci_spring_score, laci_summer_score, 
+                      laci_fall_score, laci_winter_score)
+
+map_overall_sdm <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(both_max_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Maximum SDM Scores Across Species",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+
+tmap_save(map_overall_sdm, here("outputs", "final_outputs", "map_overall_sdm.png"))
+```
+
+## Make Individual SDM Maps
+## Silver-Haired Bats
+```{r}
+# SDM maps
+## LANO
+### spring
+map_lano_spring_score <- tm_shape(laci_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(lano_spring_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Silver-Haired Bat Spring SDM",
+            legend.position = c("left", "bottom"))+
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_lano_spring_score, here("outputs", "final_outputs", "map_lano_spring_score.png"))
+
+### summer
+map_lano_summer_score <- tm_shape(laci_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(lano_summer_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Silver-Haired Bat Summer SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_lano_summer_score, here("outputs", "final_outputs", "map_lano_summer_score.png"))
+
+### fall
+map_lano_fall_score <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(lano_fall_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Silver-Haired Bat Fall SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_lano_fall_score, here("outputs", "final_outputs", "map_lano_fall_score.png"))
+
+### winter
+map_lano_winter_score <- tm_shape(laci_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(lano_winter_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Silver-Haired Bat Winter SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_lano_winter_score, here("outputs", "final_outputs", "map_lano_winter_score.png"))
+```
+
+## Hoary Bats
+```{r}
+# SDM maps
+## laci
+### spring
+map_laci_spring_score <- tm_shape(laci_spring)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(laci_spring_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Hoary Bat Spring SDM",
+            legend.position = c("left", "bottom"))+
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_laci_spring_score, here("outputs", "final_outputs", "map_laci_spring_score.png"))
+
+### summer
+map_laci_summer_score <- tm_shape(laci_summer)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(laci_summer_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Hoary Bat Summer SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_laci_summer_score, here("outputs", "final_outputs", "map_laci_summer_score.png"))
+
+### fall
+map_laci_fall_score <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(laci_fall_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Hoary Bat Fall SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_laci_fall_score, here("outputs", "final_outputs", "map_laci_fall_score.png"))
+
+### winter
+map_laci_winter_score <- tm_shape(laci_winter)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(laci_winter_score)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Suitability Score")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Hoary Bat Winter SDM",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_laci_winter_score, here("outputs", "final_outputs", "map_laci_winter_score.png"))
+```
+
+# Part 3: Overlap Assessment
+## Load all presaved data
+```{r}
+wind_site_suitability <- rast(here("outputs", "intermediate_outputs", "wind_site_suitability", "wind_site_suitability_masked.tif"))
+```
+
+
+
+## Subtract SDM scores from Wind Site Suitabilitiy Scores
+```{r}
+wind_laci_spring <- wind_site_suitability - laci_spring_score
+wind_laci_summer <- wind_site_suitability - laci_summer_score
+wind_laci_fall <- wind_site_suitability - laci_fall_score
+wind_laci_winter <- wind_site_suitability - laci_winter_score
+
+wind_lano_spring <- wind_site_suitability - lano_spring_score
+wind_lano_summer <- wind_site_suitability - lano_summer_score
+wind_lano_fall <- wind_site_suitability - lano_fall_score
+wind_lano_winter <- wind_site_suitability - lano_winter_score
+
+wind_both_spring <- wind_site_suitability - both_spring_score
+wind_both_summer <- wind_site_suitability - both_summer_score
+wind_both_fall <- wind_site_suitability - both_fall_score
+wind_both_winter <- wind_site_suitability - both_winter_score
+
+wind_laci_max <- wind_site_suitability - laci_max_score
+wind_lano_max <- wind_site_suitability - lano_max_score
+wind_both_max <- wind_site_suitability - both_max_score
+
+# make a better-named copy but don't break my code!
+bat_avoidant_suitability <- wind_both_max
+```
+
+## Seasonal Wind~SDM Maps
+```{r}
+# Hoary Bats
+
+## Spring
+map_wind_laci_spring <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_laci_spring)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Hoary Bat SDM: Spring")
+
+tmap_save(map_wind_laci_spring, here("outputs", "final_outputs", "map_wind_laci_spring.png"))
+
+## Summer
+map_wind_laci_summer <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_laci_summer)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Hoary Bat SDM: Summer")
+
+tmap_save(map_wind_laci_summer, here("outputs", "final_outputs", "map_wind_laci_summer.png"))
+
+## Fall
+map_wind_laci_fall <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_laci_fall)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Hoary Bat SDM: Fall")
+
+tmap_save(map_wind_laci_fall, here("outputs", "final_outputs", "map_wind_laci_fall.png"))
+
+## Winter
+map_wind_laci_winter <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_laci_winter)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Hoary Bat SDM: Winter")
+
+tmap_save(map_wind_laci_winter, here("outputs", "final_outputs", "map_wind_laci_winter.png"))
+
+# Silver-Haired Bats
+
+## Spring
+map_wind_lano_spring <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_lano_spring)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Silver-Haired Bat SDM: Spring")
+
+tmap_save(map_wind_lano_spring, here("outputs", "final_outputs", "map_wind_lano_spring.png"))
+
+## Summer
+map_wind_lano_summer <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_lano_summer)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Silver-Haired Bat SDM: Summer")
+
+tmap_save(map_wind_lano_summer, here("outputs", "final_outputs", "map_wind_lano_summer.png"))
+
+## Fall
+map_wind_lano_fall <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_lano_fall)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Silver-Haired Bat SDM: Fall")
+
+tmap_save(map_wind_lano_fall, here("outputs", "final_outputs", "map_wind_lano_fall.png"))
+
+## Winter
+map_wind_lano_winter <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_lano_winter)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Silver-Haired Bat SDM: Winter")
+
+tmap_save(map_wind_lano_winter, here("outputs", "final_outputs", "map_wind_lano_winter.png"))
+```
+
+# Final Maps
+```{r}
+
+
+# Hoary Bats
+map_wind_laci_max <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_laci_max)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Maximum Hoary Bat SDM Values")
+
+tmap_save(map_wind_laci_max, here("outputs", "final_outputs", "map_wind_laci_max.png"))
+
+# Silver-Haired Bats
+map_wind_lano_max <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_lano_max)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+  tm_layout(main.title = "Wind Energy Suitability Minus Maximum Silver-Haired Bat SDM Values")
+
+tmap_save(map_wind_lano_max, here("outputs", "final_outputs", "map_wind_lano_max.png"))
+
+# both species
+map_wind_both_max <- tm_shape(laci_fall)+
+  tm_raster(palette = c("#c1c1c1"),
+            legend.show = FALSE)+
+  tm_shape(wind_both_max)+
+  tm_raster(breaks = c(0, 0.9, 1.9, 2.9, 3.9, 4),
+                          labels = c("0", "1", "2", "3", "4"),
+            palette = map_palette,
+            title = "Overalll Suitability")+
+  tm_shape(wa_border)+
+  tm_borders(lwd = 2)+
+   tm_shape(turbines_wa)+
+  tm_symbols(shape = 24,
+             col = "black",
+             border.lwd = 0.001,
+             border.col = "black",
+             size = 0.01)+
+  tm_layout(main.title = "Bat-Avoidant Wind Energy Site Suitability",
+            legend.position = c("left", "bottom")) +
+  tm_compass(show.labels = 1, position = c("right", "bottom"))+
+  tm_scale_bar(position = c("right", "bottom"))
+
+tmap_save(map_wind_both_max, here("outputs", "final_outputs", "map_wind_both_max.png"))
+
+```
+# Assess Existing Turbine Locations Against Results
+## Against General Wind Site Suitability
+```{r}
+# vectorize suitabiltiy raster
+rcl_wind <- matrix(c(NA, 0),
+               ncol=2, byrow=TRUE)
+
+wind_suit_with_zeroes <- classify(wind_site_suitability_masked, rcl = rcl_wind)
+
+wind_suit_vector <- terra::as.polygons(wind_suit_with_zeroes, values = TRUE) %>% 
+    st_as_sf()
+
+wind_0 <- wind_suit_vector %>% 
+  filter(sum == 0)
+
+wind_1 <- wind_suit_vector %>% 
+  filter(sum == 1)
+
+wind_2 <- wind_suit_vector %>% 
+  filter(sum == 2)
+
+wind_3 <- wind_suit_vector %>% 
+  filter(sum == 3)
+
+wind_4 <- wind_suit_vector %>% 
+  filter(sum == 4)
+
+turbines_0 <- turbines_wa %>% 
+  st_filter(., wind_0,
+            .predicate = st_intersects) %>% 
+  mutate("suitability_score" = as.factor(0))
+
+turbines_1 <- turbines_wa %>% 
+  st_filter(., wind_1,
+            .predicate = st_intersects) %>% 
+  mutate("suitability_score" = as.factor(1))
+
+turbines_2 <- turbines_wa %>% 
+  st_filter(., wind_2,
+            .predicate = st_intersects) %>% 
+  mutate("suitability_score" = as.factor(2))
+
+turbines_3 <- turbines_wa %>% 
+  st_filter(., wind_3,
+            .predicate = st_intersects) %>% 
+  mutate("suitability_score" = as.factor(3))
+
+turbines_4 <- turbines_wa %>% 
+  st_filter(., wind_4,
+            .predicate = st_intersects) %>% 
+  mutate("suitability_score" = as.factor(4))
+
+turbines_score <- bind_rows(turbines_0, turbines_1, turbines_2,
+                              turbines_3, turbines_4)
+
+
+plot_turbines_general_score <- ggplot(turbines_score, aes(x = suitability_score)) +
+  geom_histogram(aes(fill = suitability_score),
+                 stat = "count",
+                 show.legend = FALSE) +
+  scale_fill_manual(values = map_palette)+
+  scale_x_discrete(drop = FALSE)+
+  labs(x = "Baseline Wind Energy Suitability Score", y = "Count of Existing Turbines")+
+  theme_bw()
+
+ggsave(here("outputs", "final_outputs", "plot_turbines_general_score.png"), plot_turbines_general_score)
+```
+
+# against bat-avoidant wind suitability
+```{r}
+# vectorize suitabiltiy raster
+
+wind_vs_bats_zeroes <- classify(wind_both_max, rcl = rcl_wind)
+
+wind_vs_bats_vector <- terra::as.polygons(wind_vs_bats_zeroes, values = TRUE) %>% 
+    st_as_sf()
+
+wind_vs_bats_0 <- wind_vs_bats_vector %>% 
+  filter(sum == 0)
+
+wind_vs_bats_1 <- wind_vs_bats_vector %>% 
+  filter(sum == 1)
+
+wind_vs_bats_2 <- wind_vs_bats_vector %>% 
+  filter(sum == 2)
+
+wind_vs_bats_3 <- wind_vs_bats_vector %>% 
+  filter(sum == 3)
+
+wind_vs_bats_4 <- wind_vs_bats_vector %>% 
+  filter(sum == 4)
+
+turbines_vs_bats_0 <- turbines_wa %>% 
+  st_filter(., wind_vs_bats_0,
+            .predicate = st_intersects) %>% 
+  mutate("bat_avoidant_suitability_score" = as.factor(0))
+
+turbines_vs_bats_1 <- turbines_wa %>% 
+  st_filter(., wind_vs_bats_1,
+            .predicate = st_intersects)%>% 
+  mutate("bat_avoidant_suitability_score" = as.factor(1))
+
+turbines_vs_bats_2 <- turbines_wa %>% 
+  st_filter(., wind_vs_bats_2,
+            .predicate = st_intersects)%>% 
+  mutate("bat_avoidant_suitability_score" = as.factor(2))
+
+turbines_vs_bats_3 <- turbines_wa %>% 
+  st_filter(., wind_vs_bats_3,
+            .predicate = st_intersects)%>% 
+  mutate("bat_avoidant_suitability_score" = as.factor(3))
+
+turbines_vs_bats_4 <- turbines_wa %>% 
+  st_filter(., wind_vs_bats_4,
+            .predicate = st_intersects)%>% 
+  mutate("bat_avoidant_suitability_score" = as.factor(4))
+
+turbines_vs_bats <- bind_rows(turbines_vs_bats_0, turbines_vs_bats_1, turbines_vs_bats_2,
+                              turbines_vs_bats_3, turbines_vs_bats_4)
+
+
+plot_turbines_vs_bats_score <- ggplot(turbines_vs_bats, aes(x = bat_avoidant_suitability_score)) +
+  geom_histogram(aes(fill = bat_avoidant_suitability_score),
+                 stat = "count",
+                 show.legend = FALSE) +
+  scale_fill_manual(values = map_palette)+
+  scale_x_discrete(drop = FALSE)+
+  labs(x = "Bat-Avoidant Wind Energy Suitability Score", y = "Count of Existing Turbines")+
+  theme_bw()
+
+ggsave(here("outputs", "final_outputs", "plot_turbines_vs_bats_score.png"), plot_turbines_vs_bats_score)
+```
+
+## Calculate Available Area by Bat-Avoidant Suitability Score
+```{r}
+general_suitability_df <- freq(wind_site_suitability_masked)
+bat_avoidant_suitability_df <- freq(bat_avoidant_suitability)
+
+```
+
